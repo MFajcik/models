@@ -26,7 +26,10 @@ The key ops used are:
 * skipgram custom op that does input processing.
 * neg_train custom op that efficiently calculates and applies the gradient using
   true SGD.
+
+Additional edits made by Martin Fajcik
 """
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -40,7 +43,6 @@ import datetime
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 import numpy as np
-os.environ["CUDA_VISIBLE_DEVICES"]="-1"
 import tensorflow as tf
 
 word2vec = tf.load_op_library(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'word2vec_ops.so'))
@@ -82,6 +84,14 @@ flags.DEFINE_boolean(
     "If true, enters an IPython interactive session to play with the trained "
     "model. E.g., try model.analogy(b'france', b'paris', b'russia') and "
     "model.nearby([b'proton', b'elephant', b'maxwell'])")
+
+flags.DEFINE_boolean("save2vec",False,"Save model into .vec file after training.")
+flags.DEFINE_boolean("save_dict_pkl",False,"Pickle the word to index dictionary.")
+flags.DEFINE_boolean("make_topgrads_pkl",False,"Save matrix containt information about topgradients into pkl.")
+
+flags.DEFINE_boolean("validate",False,"Run validation on word analogy task during training [EN only].")
+flags.DEFINE_boolean("save_checkpoints",True,"Save network architecture and parameters after each epoch.")
+flags.DEFINE_boolean("playmode", False, "Enter mode in which checkpoint from save_path is loaded and ipython console is enabled.")
 
 FLAGS = flags.FLAGS
 
@@ -157,7 +167,7 @@ class Word2Vec(object):
         print ("Done")
 
         #self.examples = np.zeros(shape=(self._options.vocab_size, ladder_size),dtype=np.int32)
-        self.example_positions = np.zeros(shape=(self._options.vocab_size, ladder_size),dtype=np.uint64)
+        self.gradient_positions = np.zeros(shape=(self._options.vocab_size, ladder_size), dtype=np.uint64)
         self.gradients = np.zeros(shape=(self._options.vocab_size, ladder_size),dtype=np.float)
 
     # The vec file is a text file that contains the word vectors, one per line for each word in the vocabulary.
@@ -312,7 +322,7 @@ class Word2Vec(object):
         pass
     def get_pos(self,w):
         #return self._session.run([self.pos_graph], {self._word_id: self._word2id.get(w, 0)})[0]
-        return self.example_positions[self._word2id[w]]
+        return self.gradient_positions[self._word2id[w]]
 
     def build_find_nearest_graph(self, nearest_word_count=10):
         opts=self._options
@@ -407,9 +417,9 @@ class Word2Vec(object):
             p = self.find_insert_pos(example,gradient)
             if p>=0:
                 #self.examples[example,shift_from+1:] = self.examples[example,shift_from:-1]
-                self.example_positions[example,p+1:] = self.example_positions[example,p:-1]
+                self.gradient_positions[example, p + 1:] = self.gradient_positions[example, p:-1]
                 self.gradients[example,p+1:] = self.gradients[example,p:-1]
-                self.example_positions[example,p] = position
+                self.gradient_positions[example, p] = position
                 self.gradients[example,p] = gradient
 
     def _train_thread_body(self):
@@ -535,8 +545,6 @@ def _start_shell(local_ns=None):
     IPython.start_ipython(argv=[], user_ns=user_ns)
 
 
-    """ Custom edit by ifajcik --hardcode params"""
-
 #FLAGS.train_data = "/mnt/minerva1/nlp/projects/semantic_relatedness10/data/my_preprocessed/cs.txt_2017-10-25_12:19"
 #FLAGS.train_data = "/home/ifajcik/deep_learning/word2vec/corpus_data/ebooks_corpus_CZ/few_sentences.txt"
 FLAGS.train_data = "/home/ifajcik/deep_learning/word2vec/corpus_data/ebooks_corpus_CZ/e_knihy_preprocessed.txt"
@@ -560,55 +568,51 @@ def find_word_contexts(model, word, window_size =FLAGS.window_size * 2, corpus =
             contexts.append(chunk1[-(window_size+1):]+chunk2[:window_size])
     return contexts,positions
 
+def disable_GPU():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 def main(_):
-    # idx[question, j]
+    disable_GPU()
     """Train a word2vec model."""
     if not FLAGS.train_data or not FLAGS.eval_data or not FLAGS.save_path:
         print("--train_data --eval_data and --save_path must be specified.")
         sys.exit(1)
     opts = Options()
 
-    #some dirty fsm
-    halt_ex=False
-    if INTENT_SAVE_TOVEC:
-        halt_ex = save_model_to_vec(opts)
-    if INTENT_EVAL:
-        halt_ex = play_with_model(opts)
+    if FLAGS.playmode:
+        play_with_model(opts)
 
-    if halt_ex:
-        return
-
-
+    model_n = os.path.basename(FLAGS.train_data)
     with tf.Graph().as_default(), tf.Session() as session:
         with tf.device("/cpu:0"):
             model = Word2Vec(opts, session)
-            # model.read_analogies()  # Read analogy questions
+            if FLAGS.validate:
+                model.read_analogies()  # Read analogy questions
             print("Starting training: {}".format(datetime.date.today()))
             print("Epochs to train: {}".format(opts.epochs_to_train))
             for i in range(opts.epochs_to_train):
                 model.train()  # Process one epoch
-                # #Save each epoch
-                model.saver.save(session, os.path.join(opts.save_path, "model_{}_e{}.ckpt".format(MODEL_NAME,i)),
-                       global_step=model.global_step)
-                pass
+                if FLAGS.validate:
+                    model.eval()
+                if FLAGS.save_checkpoints:
+                    model.saver.save(session, os.path.join(opts.save_path, "model_{}_e{}.ckpt".format(model_n,i)),
+                           global_step=model.global_step)
 
         print("Training finished: {}".format(datetime.date.today()))
-        #word_context_formatted(model, "přijímat")
-        #toppositions = session.run(model._pos_by_gradient_ladder)
-        #toppositions[model._word2id["přijímat"]]
-        with open ("w2i_ebooks.pkl", "wb") as f:
-            pickle.dump(model._word2id, f, pickle.HIGHEST_PROTOCOL)
-        # with open('toppositions_ebooks.pkl', 'wb') as output:
-        #     pickle.dump(model.example_positions, output, pickle.HIGHEST_PROTOCOL)
-        #
-        # with open('topgrads_ebooks.pkl', 'wb') as output:
-        #     pickle.dump(model.gradients, output, pickle.HIGHEST_PROTOCOL)
-        # with open('toppositions_CWC50M.pkl', 'rb') as input:
-        #     model.example_positions=pickle.load(input)
-        #
-        # with open('topgrads_CWC50M.pkl', 'rb') as input:
-        #     model.gradients=pickle.load(input)
-        # FLAGS.interactive = True
+
+        if FLAGS.save_dict_pkl:
+            with open ("w2i_{}.pkl".format(model_n), "wb") as f:
+                pickle.dump(model._word2id, f, pickle.HIGHEST_PROTOCOL)
+
+        if FLAGS.make_topgrads_pkl:
+            with open('toppositions_{}.pkl'.format(model_n), 'wb') as output:
+                pickle.dump(model.gradient_positions, output, pickle.HIGHEST_PROTOCOL)
+
+            with open('topgrads_{}.pkl'.format(model_n), 'wb') as output:
+                pickle.dump(model.gradients, output, pickle.HIGHEST_PROTOCOL)
+
+        if FLAGS.save2vec:
+            save_model_to_vec(opts)
         if FLAGS.interactive:
             # E.g.,
             # [0]: model.analogy(b'france', b'paris', b'russia')
@@ -616,36 +620,26 @@ def main(_):
             _start_shell(locals())
 
 
-def save_model_to_vec(opts):
+def save_model_to_vec(opts, restore_from_save_path=False):
+    with tf.Session() as session:
+        model = Word2Vec(opts, session)
+        if restore_from_save_path:
+            print('Restoring model...')
+            model_n = os.path.basename(FLAGS.train_data)
+            model.saver.restore(session, tf.train.latest_checkpoint(FLAGS.save_path))
+        model.save_to_vec(os.path.join(FLAGS.save_path, "{}_model.vec".format(model_n)))
+    return True
+
+def play_with_model(opts):
     with tf.Session() as session:
         model = Word2Vec(opts, session)
         print('Restoring model...')
-        FLAGS.save_path = "."
-        model.saver.restore(session, tf.train.latest_checkpoint(FLAGS.save_path))
-        model.save_to_vec(os.path.join(FLAGS.save_path, "ebooks_10_gl_model.vec"))
-    return True
-
-MODEL=FLAGS.save_path
-OLDMODEL="/home/ifajcik/word2vec/trainedmodels/tf_w2vopt_ebooks_lemmatized_and_stemmed_1iteration"
-def play_with_model(opts):
-    with tf.Session() as session:s
-        model = Word2Vec(opts, session)
-        print('Restoring model...')
-        model.saver.restore(session, tf.train.latest_checkpoint(MODEL))
-
-        #model_old = Word2Vec(opts, session)
-        #print('Restoring old model...')
-        #model_old.saver.restore(session, tf.train.latest_checkpoint(OLDMODEL))
+        model.saver.restore(session, tf.train.latest_checkpoint(opts.save_path))
 
         #nearest_words = model._find_nearest('oko')
         #print(' '.join(nearest_words))
-        #_start_shell(locals())
+        _start_shell(locals())
     return True
-
-MODEL_NAME="test_ebooks"
-INTENT_EVAL=False
-INTENT_SAVE_TOVEC=True
-INTENT_TRAIN=False
 
 if __name__ == "__main__":
     tf.app.run()
